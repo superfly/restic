@@ -133,7 +133,7 @@ func runSnapshots(ctx context.Context, opts SnapshotOptions, gopts GlobalOptions
 	}
 
 	if gopts.JSON {
-		err := printSnapshotGroupJSON(globalOptions.stdout, snapshotGroups, grouped)
+		err := printSnapshotGroupJSON(globalOptions.stdout, snapshotGroups, grouped, usage)
 		if err != nil {
 			Warnf("error printing snapshots: %v\n", err)
 		}
@@ -445,6 +445,7 @@ type Snapshot struct {
 
 	ID      *restic.ID `json:"id"`
 	ShortID string     `json:"short_id"` // deprecated
+	Usage   uint64     `json:"usage,omitempty"`
 }
 
 // SnapshotGroup helps to print SnapshotGroups as JSON with their GroupReasons included.
@@ -454,7 +455,7 @@ type SnapshotGroup struct {
 }
 
 // printSnapshotGroupJSON writes the JSON representation of list to stdout.
-func printSnapshotGroupJSON(stdout io.Writer, snGroups map[string]restic.Snapshots, grouped bool) error {
+func printSnapshotGroupJSON(stdout io.Writer, snGroups map[string]restic.Snapshots, grouped bool, usage map[restic.ID]uint64) error {
 	if grouped {
 		snapshotGroups := []SnapshotGroup{}
 
@@ -473,6 +474,7 @@ func printSnapshotGroupJSON(stdout io.Writer, snGroups map[string]restic.Snapsho
 					Snapshot: sn,
 					ID:       sn.ID(),
 					ShortID:  sn.ID().Str(),
+					Usage:    usage[*sn.ID()],
 				}
 				snapshots = append(snapshots, k)
 			}
@@ -496,6 +498,7 @@ func printSnapshotGroupJSON(stdout io.Writer, snGroups map[string]restic.Snapsho
 				Snapshot: sn,
 				ID:       sn.ID(),
 				ShortID:  sn.ID().Str(),
+				Usage:    usage[*sn.ID()],
 			}
 			snapshots = append(snapshots, k)
 		}
