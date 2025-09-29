@@ -7,12 +7,16 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui"
+	"github.com/restic/restic/internal/ui/progress"
 	"github.com/restic/restic/internal/ui/table"
+	"github.com/restic/restic/internal/ui/termstatus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"golang.org/x/sync/errgroup"
 )
 
 func newSnapshotsCommand() *cobra.Command {
@@ -36,7 +40,9 @@ Exit status is 12 if the password is incorrect.
 		GroupID:           cmdGroupDefault,
 		DisableAutoGenTag: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSnapshots(cmd.Context(), opts, globalOptions, args)
+			term, cancel := setupTermstatus()
+			defer cancel()
+			return runSnapshots(cmd.Context(), opts, globalOptions, args, term)
 		},
 	}
 
@@ -51,6 +57,7 @@ type SnapshotOptions struct {
 	Last    bool // This option should be removed in favour of Latest.
 	Latest  int
 	GroupBy restic.SnapshotGroupByOptions
+	Usage   bool
 }
 
 func (opts *SnapshotOptions) AddFlags(f *pflag.FlagSet) {
@@ -64,9 +71,16 @@ func (opts *SnapshotOptions) AddFlags(f *pflag.FlagSet) {
 	}
 	f.IntVar(&opts.Latest, "latest", 0, "only show the last `n` snapshots for each host and path")
 	f.VarP(&opts.GroupBy, "group-by", "g", "`group` snapshots by host, paths and/or tags, separated by comma")
+	f.BoolVar(&opts.Usage, "usage", false, "show storage usage per snapshot. Deduplicated data is attributed to the oldest snapshot that includes it")
 }
 
-func runSnapshots(ctx context.Context, opts SnapshotOptions, gopts GlobalOptions, args []string) error {
+func runSnapshots(ctx context.Context, opts SnapshotOptions, gopts GlobalOptions, args []string, term *termstatus.Terminal) error {
+	verbosity := gopts.verbosity
+	if gopts.JSON {
+		verbosity = 0
+	}
+	printer := newTerminalProgressPrinter(verbosity, term)
+
 	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
 	if err != nil {
 		return err
@@ -101,6 +115,23 @@ func runSnapshots(ctx context.Context, opts SnapshotOptions, gopts GlobalOptions
 		snapshotGroups[k] = list
 	}
 
+	var usage map[restic.ID]uint64
+	if opts.Usage {
+		bar := newIndexTerminalProgress(gopts.Quiet, gopts.JSON, term)
+		if err := repo.LoadIndex(ctx, bar); err != nil {
+			return err
+		}
+
+		printer.P("calculating usage for %d snapshots", len(snapshots))
+		bar = printer.NewCounter("snapshots")
+		bar.SetMax(uint64(len(snapshots)))
+		usage, err = calculateSnapshotsUsage(ctx, repo, snapshots, bar)
+		bar.Done()
+		if err != nil {
+			return fmt.Errorf("calculating snapshot usage: %w", err)
+		}
+	}
+
 	if gopts.JSON {
 		err := printSnapshotGroupJSON(globalOptions.stdout, snapshotGroups, grouped)
 		if err != nil {
@@ -121,7 +152,7 @@ func runSnapshots(ctx context.Context, opts SnapshotOptions, gopts GlobalOptions
 				return nil
 			}
 		}
-		PrintSnapshots(globalOptions.stdout, list, nil, opts.Compact)
+		PrintSnapshots(globalOptions.stdout, list, nil, usage, opts.Compact)
 	}
 
 	return nil
@@ -164,8 +195,78 @@ func FilterLatestSnapshots(list restic.Snapshots, limit int) restic.Snapshots {
 	return results
 }
 
+// calculateSnapshotsUsage calculates storage usage for snapshots.
+// The oldest snapshot that references a blob is attributed the blob's size.
+func calculateSnapshotsUsage(ctx context.Context, repo restic.Repository, snapshots restic.Snapshots, p *progress.Counter) (map[restic.ID]uint64, error) {
+	sortedSnapshots := make([]*restic.Snapshot, len(snapshots))
+	copy(sortedSnapshots, snapshots)
+	sort.Slice(sortedSnapshots, func(i, j int) bool {
+		return sortedSnapshots[i].Time.Before(sortedSnapshots[j].Time)
+	})
+
+	usage := make(map[restic.ID]uint64)
+	seenBlobs := restic.NewBlobSet()
+	recordBlobUsage := func(sn *restic.Snapshot, bh restic.BlobHandle) bool {
+		if seenBlobs.Has(bh) {
+			return true
+		}
+		seenBlobs.Insert(bh)
+
+		if pbs := repo.LookupBlob(bh.Type, bh.ID); len(pbs) > 0 {
+			// Length is the compressed and encrypted size of the blob
+			usage[*sn.ID()] += uint64(pbs[0].Length)
+		}
+
+		return false
+	}
+
+	for _, sn := range sortedSnapshots {
+		var lock sync.Mutex
+
+		wg, ctx := errgroup.WithContext(ctx)
+		treeStream := restic.StreamTrees(ctx, wg, repo, restic.IDs{*sn.Tree}, func(treeID restic.ID) bool {
+			// locking is necessary the goroutine below concurrently adds data blobs
+			lock.Lock()
+			h := restic.BlobHandle{ID: treeID, Type: restic.TreeBlob}
+			skip := recordBlobUsage(sn, h)
+			lock.Unlock()
+			return skip
+		}, nil)
+
+		wg.Go(func() error {
+			for tree := range treeStream {
+				if tree.Error != nil {
+					return tree.Error
+				}
+
+				lock.Lock()
+				for _, node := range tree.Nodes {
+					switch node.Type {
+					case restic.NodeTypeFile:
+						for _, blob := range node.Content {
+							h := restic.BlobHandle{ID: blob, Type: restic.DataBlob}
+							recordBlobUsage(sn, h)
+						}
+					}
+				}
+				lock.Unlock()
+			}
+			return nil
+		})
+		if err := wg.Wait(); err != nil {
+			return nil, err
+		}
+
+		if p != nil {
+			p.Add(1)
+		}
+	}
+
+	return usage, nil
+}
+
 // PrintSnapshots prints a text table of the snapshots in list to stdout.
-func PrintSnapshots(stdout io.Writer, list restic.Snapshots, reasons []restic.KeepReason, compact bool) {
+func PrintSnapshots(stdout io.Writer, list restic.Snapshots, reasons []restic.KeepReason, usage map[restic.ID]uint64, compact bool) {
 	// keep the reasons a snasphot is being kept in a map, so that it doesn't
 	// get lost when the list of snapshots is sorted
 	keepReasons := make(map[restic.ID]restic.KeepReason, len(reasons))
@@ -180,6 +281,9 @@ func PrintSnapshots(stdout io.Writer, list restic.Snapshots, reasons []restic.Ke
 	for _, sn := range list {
 		hasSize = hasSize || (sn.Summary != nil)
 	}
+
+	// check if we have usage data
+	hasUsage := usage != nil
 
 	// always sort the snapshots so that the newer ones are listed last
 	sort.SliceStable(list, func(i, j int) bool {
@@ -209,6 +313,9 @@ func PrintSnapshots(stdout io.Writer, list restic.Snapshots, reasons []restic.Ke
 		if hasSize {
 			tab.AddColumn("Size", `{{ .Size }}`)
 		}
+		if hasUsage {
+			tab.AddColumn("Usage", `{{ .Usage }}`)
+		}
 	} else {
 		tab.AddColumn("ID", "{{ .ID }}")
 		tab.AddColumn("Time", "{{ .Timestamp }}")
@@ -221,6 +328,9 @@ func PrintSnapshots(stdout io.Writer, list restic.Snapshots, reasons []restic.Ke
 		if hasSize {
 			tab.AddColumn("Size", `{{ .Size }}`)
 		}
+		if hasUsage {
+			tab.AddColumn("Usage", `{{ .Usage }}`)
+		}
 	}
 
 	type snapshot struct {
@@ -231,6 +341,7 @@ func PrintSnapshots(stdout io.Writer, list restic.Snapshots, reasons []restic.Ke
 		Reasons   []string
 		Paths     []string
 		Size      string
+		Usage     string
 	}
 
 	var multiline bool
@@ -254,6 +365,12 @@ func PrintSnapshots(stdout io.Writer, list restic.Snapshots, reasons []restic.Ke
 
 		if sn.Summary != nil {
 			data.Size = ui.FormatBytes(sn.Summary.TotalBytesProcessed)
+		}
+
+		if hasUsage {
+			id := sn.ID()
+			usage := usage[*id]
+			data.Usage = ui.FormatBytes(usage)
 		}
 
 		tab.AddRow(data)
